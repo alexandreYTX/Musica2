@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Estúdio de Voz (Gemini)</title>
+<style>
+  body{font-family:system-ui,sans-serif;background:#111;color:#eee;max-width:520px;margin:0 auto;padding:16px}
+  h1{font-size:22px} h2{font-size:16px;margin:24px 0 8px;color:#8fd}
+  input,textarea,select,button{width:100%;box-sizing:border-box;padding:12px;margin:4px 0;border-radius:10px;border:1px solid #444;background:#222;color:#eee;font-size:16px}
+  button{background:#6c4cff;border:0;font-weight:600} button:disabled{opacity:.4}
+  label.chk{display:flex;gap:8px;align-items:center} label.chk input{width:auto}
+  #log{font-size:13px;color:#aaa;white-space:pre-wrap;margin-top:12px;word-break:break-word}
+  audio{width:100%;margin-top:8px}
+</style>
+</head>
+<body>
+<h1>🎤 Estúdio de Voz</h1>
+
+<h2>0. Sua chave do Gemini (Google AI Studio)</h2>
+<input id="key" type="password" placeholder="Cole sua API key">
+<label class="chk"><input type="checkbox" id="lembrar"> Lembrar a chave neste celular</label>
+
+<h2>1. Grave sua voz (cantando ou rimando)</h2>
+<button id="rec">⏺ Gravar</button>
+<audio id="vozPlayer" controls hidden></audio>
+
+<h2>2. Descreva a base</h2>
+<textarea id="prompt" rows="3" placeholder="Ex: beat de trap melódico, 140 bpm, grave pesado"></textarea>
+<label class="chk"><input type="checkbox" id="instr" checked> Só instrumental (sem voz cantando)</label>
+<select id="modelo">
+  <option value="lyria-3-clip-preview">Clipe de 30s (bom pra testar)</option>
+  <option value="lyria-3.5">Música completa (demora mais)</option>
+</select>
+
+<h2>3. Mixagem</h2>
+<label>Volume da voz <input id="gVoz" type="range" min="0" max="2" step="0.1" value="1.2"></label>
+<label>Volume da base <input id="gBase" type="range" min="0" max="2" step="0.1" value="0.7"></label>
+
+<button id="go">✨ Criar música</button>
+<div id="log"></div>
+<audio id="final" controls hidden></audio>
+<a id="dl" hidden><button>⬇ Baixar WAV</button></a>
+
+<script>
+const $ = id => document.getElementById(id);
+const log = t => $('log').textContent += t + '\n';
+let vozBlob = null, recorder = null, chunks = [];
+
+// ---------- chave guardada no celular (opcional) ----------
+try {
+  const k = localStorage.getItem('gemini_key');
+  if (k) { $('key').value = k; $('lembrar').checked = true; }
+} catch (e) {}
+
+// ---------- 1. GRAVAR ----------
+$('rec').onclick = async () => {
+  if (recorder && recorder.state === 'recording') { recorder.stop(); return; }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    recorder = new MediaRecorder(stream);
+    chunks = [];
+    recorder.ondataavailable = e => chunks.push(e.data);
+    recorder.onstop = () => {
+      vozBlob = new Blob(chunks, { type: recorder.mimeType });
+      $('vozPlayer').src = URL.createObjectURL(vozBlob);
+      $('vozPlayer').hidden = false;
+      $('rec').textContent = '⏺ Gravar de novo';
+      stream.getTracks().forEach(t => t.stop());
+    };
+    recorder.start();
+    $('rec').textContent = '⏹ Parar';
+  } catch (e) { log('Erro no microfone: ' + e.message); }
+};
+
+// ---------- 2. GERAR BASE (Gemini / Lyria) ----------
+function b64ParaBlob(b64, mime) {
+  const bin = atob(b64), arr = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+  return new Blob([arr], { type: mime });
+}
+
+async function gerarBase(prompt, modelo, key) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelo}:generateContent`;
+  const r = await fetch(url, {
+    method: 'POST',
+    headers: { 'x-goog-api-key': key, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
+  });
+  const txt = await r.text();
+  if (!r.ok) throw new Error('Gemini respondeu ' + r.status + ': ' + txt.slice(0, 300));
+  const data = JSON.parse(txt);
+  const parts = data?.candidates?.[0]?.content?.parts || [];
+  for (const p of parts) {
+    const inl = p.inlineData || p.inline_data;
+    if (inl && inl.data) return b64ParaBlob(inl.data, inl.mimeType || inl.mime_type || 'audio/mpeg');
+  }
+  throw new Error('A resposta veio sem áudio: ' + txt.slice(0, 300));
+}
+
+// ---------- 3. MIXAR ----------
+async function mixar(vozB, baseB, gVoz, gBase) {
+  const ctx = new AudioContext();
+  const [voz, base] = await Promise.all([
+    ctx.decodeAudioData(await vozB.arrayBuffer()),
+    ctx.decodeAudioData(await baseB.arrayBuffer())
+  ]);
+  const dur = Math.max(voz.duration, base.duration);
+  const off = new OfflineAudioContext(2, Math.ceil(dur * 44100), 44100);
+  [[voz, gVoz], [base, gBase]].forEach(([buf, g]) => {
+    const s = off.createBufferSource(); s.buffer = buf;
+    const gain = off.createGain(); gain.gain.value = g;
+    s.connect(gain).connect(off.destination); s.start();
+  });
+  return await off.startRendering();
+}
+
+function paraWav(buf) {
+  const ch = buf.numberOfChannels, len = buf.length * ch * 2 + 44;
+  const v = new DataView(new ArrayBuffer(len));
+  const w = (o, s) => [...s].forEach((c, i) => v.setUint8(o + i, c.charCodeAt(0)));
+  w(0, 'RIFF'); v.setUint32(4, len - 8, true); w(8, 'WAVEfmt ');
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, ch, true);
+  v.setUint32(24, buf.sampleRate, true); v.setUint32(28, buf.sampleRate * ch * 2, true);
+  v.setUint16(32, ch * 2, true); v.setUint16(34, 16, true); w(36, 'data'); v.setUint32(40, len - 44, true);
+  let o = 44;
+  for (let i = 0; i < buf.length; i++)
+    for (let c = 0; c < ch; c++) {
+      const x = Math.max(-1, Math.min(1, buf.getChannelData(c)[i]));
+      v.setInt16(o, x < 0 ? x * 0x8000 : x * 0x7fff, true); o += 2;
+    }
+  return new Blob([v], { type: 'audio/wav' });
+}
+
+// ---------- BOTÃO PRINCIPAL ----------
+$('go').onclick = async () => {
+  const key = $('key').value.trim();
+  if (!key) return log('Cole sua API key.');
+  if (!vozBlob) return log('Grave sua voz primeiro.');
+  if (!$('prompt').value.trim()) return log('Descreva a base.');
+  try {
+    if ($('lembrar').checked) localStorage.setItem('gemini_key', key);
+    else localStorage.removeItem('gemini_key');
+  } catch (e) {}
+  $('go').disabled = true; $('log').textContent = '';
+  try {
+    let prompt = $('prompt').value.trim();
+    if ($('instr').checked) prompt += '. Instrumental only, no vocals, no singing.';
+    log('Gerando a base (pode levar um minuto)...');
+    const base = await gerarBase(prompt, $('modelo').value, key);
+    log('Mixando...');
+    const mix = await mixar(vozBlob, base, +$('gVoz').value, +$('gBase').value);
+    const wav = paraWav(mix), url = URL.createObjectURL(wav);
+    $('final').src = url; $('final').hidden = false;
+    $('dl').href = url; $('dl').download = 'minha-musica.wav'; $('dl').hidden = false;
+    log('Pronto! 🎶');
+  } catch (e) { log('Erro: ' + e.message); }
+  $('go').disabled = false;
+};
+</script>
+</body>
+</html>
